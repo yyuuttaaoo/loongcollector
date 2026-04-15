@@ -40,7 +40,7 @@
 | JournalPaths | Array，其中value为String，无默认值（必填） | Journal日志路径，建议直接填写Journal日志所在文件夹，例如`/var/log/journal`。 |
 | SeekPosition | string，`tail` | 首次采集方式，为head则采集所有数据，为tail则只采集配置应用后新的数据。 |
 | Kernel | bool，`true` | 为false时则不采集内核日志。 |
-| Units | Array，其中value为String，`[]` | 指定采集的Unit列表，为空时则全部采集。 |
+| Units | Array，其中value为String，`[]` | 指定采集的Unit列表，为空时则全部采集。当前版本该参数按system unit字段进行匹配（例如`_SYSTEMD_UNIT`）。 |
 | ParseSyslogFacility | bool，`false` | 是否解析syslog日志的facility字段。 |
 | ParsePriority | bool，`false` | 是否解析Priority字段。|
 | UseJournalEventTime | bool，`false` | 是否使用Journal日志中的字段作为日志时间，即使用采集时间作为日志时间（实时日志采集一般相差3秒以内）。|
@@ -48,6 +48,8 @@
 | CursorSeekFallback | string，`SeekPositionTail` | 日志读取检查点回退的位置。 |
 | Identifiers | Array，其中value为String，`[]` | syslog标识符，可以添加到监视器。 |
 | MatchPatterns | Array，其中value为String，`[]` | 匹配规则，可以添加到监视器。 |
+
+> 说明：如果需要对齐 `journalctl --user -u <unit>` 的采集效果，建议使用 `MatchPatterns` 按用户级字段过滤（例如 `_SYSTEMD_USER_UNIT=<unit>.service`），并结合 `_UID=<uid>` 进一步收敛范围。
 
 ParsePriority映射关系表如下：
 
@@ -166,3 +168,31 @@ flushers:
     "_realtime_timestamp_":  "1547975837008708",
 }
 ```
+
+### 样例3
+
+采集用户级Unit日志（等价于 `journalctl --user -u openclaw-gateway` 的常见筛选思路）。
+
+* 采集配置3
+
+```yaml
+enable: true
+inputs:
+  - Type: service_journal
+    JournalPaths:
+      - "/var/log/journal"
+    Kernel: false
+    ParsePriority: true
+    ParseSyslogFacility: true
+    MatchPatterns:
+      - "_SYSTEMD_USER_UNIT=openclaw-gateway.service"
+      - "_UID=1000"
+flushers:
+  - Type: flusher_stdout
+    OnlyStdout: true
+```
+
+> 说明：
+> - `Units` 参数当前主要匹配system unit字段，不建议直接用于用户级unit过滤。
+> - `_UID` 请按实际用户ID调整；如无需限定用户可移除该条件。
+> - 若环境启用了运行时journal，也可按需将路径补充为 `/run/log/journal`。

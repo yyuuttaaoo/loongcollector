@@ -17,6 +17,8 @@ package inputsyslog
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +55,15 @@ type Syslog struct {
 	IgnoreParseFailure bool   // When parse failure happened, ignore error and set content field if it is set.
 	AddHostname        bool   // When listen unixgram from /dev/log, the hostname field is not included in the log, so use rfc3164 will cause parse error, so AddHostname give parser it's own hostname, then parser can parse tag, program, content field currently.
 
+	// TLS configuration (TCP only)
+	TLSEnable            bool   // Enable TLS for TCP connections.
+	TLSCertFile          string // Path to server certificate file (PEM format).
+	TLSKeyFile           string // Path to server private key file (PEM format).
+	TLSCAFile            string // Path to CA certificate file for client verification (optional).
+	TLSMinVersion        string // Minimum TLS version: "1.0", "1.1", "1.2", "1.3". Default is "1.2".
+	TLSClientAuth        string // Client auth mode: "none", "optional", "require". Default is "none".
+	TLSInsecureSkipVerify bool   // Skip client certificate verification (not recommended for production).
+
 	done chan struct{}
 	mu   sync.Mutex
 	wg   sync.WaitGroup
@@ -67,6 +78,76 @@ type Syslog struct {
 	tcpListener   net.Listener
 	udpListener   net.PacketConn
 	parser        parser
+	tlsConfig     *tls.Config
+}
+
+// tlsVersionMap maps TLS version strings to tls.Version constants.
+var tlsVersionMap = map[string]uint16{
+	"":    tls.VersionTLS12, // default
+	"1.0": tls.VersionTLS10,
+	"1.1": tls.VersionTLS11,
+	"1.2": tls.VersionTLS12,
+	"1.3": tls.VersionTLS13,
+}
+
+// tlsClientAuthMap maps client auth mode strings to tls.ClientAuthType constants.
+var tlsClientAuthMap = map[string]tls.ClientAuthType{
+	"":         tls.NoClientCert, // default
+	"none":     tls.NoClientCert,
+	"optional": tls.VerifyClientCertIfGiven,
+	"require":  tls.RequireAndVerifyClientCert,
+}
+
+// loadTLSConfig loads TLS configuration from the specified files.
+func (s *Syslog) loadTLSConfig() (*tls.Config, error) {
+	if !s.TLSEnable {
+		return nil, nil
+	}
+
+	// Validate required fields
+	if s.TLSCertFile == "" || s.TLSKeyFile == "" {
+		return nil, errors.New("TLSCertFile and TLSKeyFile are required when TLS is enabled")
+	}
+
+	// Load server certificate and key
+	cert, err := tls.LoadX509KeyPair(s.TLSCertFile, s.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+
+	// Get TLS version
+	minVersion, ok := tlsVersionMap[s.TLSMinVersion]
+	if !ok {
+		return nil, fmt.Errorf("unsupported TLS version: %s", s.TLSMinVersion)
+	}
+
+	// Get client auth mode
+	clientAuth, ok := tlsClientAuthMap[strings.ToLower(s.TLSClientAuth)]
+	if !ok {
+		return nil, fmt.Errorf("unsupported TLS client auth mode: %s", s.TLSClientAuth)
+	}
+
+	config := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         minVersion,
+		ClientAuth:         clientAuth,
+		InsecureSkipVerify: s.TLSInsecureSkipVerify, //nolint:gosec
+	}
+
+	// Load CA certificate if specified (for client verification)
+	if s.TLSCAFile != "" {
+		caCert, err := os.ReadFile(s.TLSCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load CA certificate: %w", err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.New("failed to parse CA certificate")
+		}
+		config.ClientCAs = caCertPool
+	}
+
+	return config, nil
 }
 
 // Init ...
@@ -87,6 +168,13 @@ func (s *Syslog) Init(context pipeline.Context) (int, error) {
 		ignoreParseFailure: s.IgnoreParseFailure,
 		addHostname:        s.AddHostname,
 	})
+
+	// Load TLS configuration
+	tlsConfig, err := s.loadTLSConfig()
+	if err != nil {
+		return 0, fmt.Errorf("failed to load TLS config: %w", err)
+	}
+	s.tlsConfig = tlsConfig
 
 	s.context = context
 	logger.Debug(s.context.GetRuntimeContext(), "syslog load config", s.context.GetConfigName())
@@ -130,6 +218,13 @@ func (s *Syslog) Start(collector pipeline.Collector) error {
 				"Address", s.Address, "scheme", scheme, "host", host)
 			return err
 		}
+
+		// Wrap with TLS if enabled
+		if s.tlsConfig != nil {
+			l = tls.NewListener(l, s.tlsConfig)
+			logger.Info(s.context.GetRuntimeContext(), "TLS enabled for syslog listener", s.Address)
+		}
+
 		s.tcpListener = l
 		s.Closer = l
 
